@@ -69,7 +69,7 @@ def test_invalid_data_is_rejected():
         core_metrics(frame)
 
 
-def test_api_analytics_endpoints_return_real_schema():
+def test_api_analytics_endpoints_return_real_schema(synthetic_dataset):
     client = TestClient(app)
     health = client.get("/api/health")
     executive = client.get("/api/analytics/executive")
@@ -80,6 +80,42 @@ def test_api_analytics_endpoints_return_real_schema():
     assert revenue.status_code == 200
     assert products.status_code == 200
     assert "pareto" in revenue.json()
+    expected_revenue = float(
+        (synthetic_dataset["transaction_qty"] * synthetic_dataset["unit_price"]).sum()
+    )
+    assert executive.json()["kpis"]["total_revenue"] == expected_revenue
+    assert executive.json()["kpis"]["total_transactions"] == len(synthetic_dataset)
+    assert executive.json()["kpis"]["active_products"] == synthetic_dataset["product_id"].nunique()
+    assert len(products.json()["products"]) == 1
+    assert products.json()["products"][0]["product_detail"] == "Ethiopia Single Origin"
+
+
+def test_data_profile_uses_temporary_excel_source(synthetic_dataset):
+    response = TestClient(app).get("/api/data/profile")
+
+    assert response.status_code == 200
+    profile = response.json()
+    assert profile["dataset"]["name"] == "synthetic_transactions.xlsx"
+    assert profile["dataset"]["rows"] == len(synthetic_dataset)
+    assert profile["dataset"]["columns"] == [
+        "transaction_id",
+        "year",
+        "transaction_time",
+        "transaction_qty",
+        "store_id",
+        "store_location",
+        "product_id",
+        "unit_price",
+        "product_category",
+        "product_type",
+        "product_detail",
+    ]
+    assert profile["dataset"]["missing_values"] == 0
+    assert list(synthetic_dataset.columns) == profile["dataset"]["columns"]
+    for column in ["transaction_id", "year", "transaction_qty", "store_id", "product_id", "unit_price"]:
+        assert pd.api.types.is_numeric_dtype(synthetic_dataset[column])
+    assert synthetic_dataset["transaction_time"].map(lambda value: isinstance(value, str)).all()
+    assert synthetic_dataset["store_location"].map(lambda value: isinstance(value, str)).all()
 
 
 def test_product_segmentation_returns_supported_segments():
@@ -119,38 +155,78 @@ def test_anomaly_and_statistics_are_explainable():
     assert "correlation_matrix" in statistics
 
 
-def test_phase4_api_routes():
+def test_phase4_api_routes(synthetic_dataset):
     client = TestClient(app)
-    for path in ["segmentation", "clustering", "anomalies", "statistics"]:
-        response = client.get(f"/api/analytics/{path}")
-        assert response.status_code == 200
+    segmentation = client.get("/api/analytics/segmentation")
+    clustering = client.get("/api/analytics/clustering")
+    anomalies = client.get("/api/analytics/anomalies")
+    statistics = client.get("/api/analytics/statistics")
+
+    assert segmentation.status_code == 200
+    assert len(segmentation.json()["products"]) == synthetic_dataset["product_id"].nunique()
+    assert clustering.status_code == 200
+    assert clustering.json()["supported"] is True
+    assert len(clustering.json()["points"]) == synthetic_dataset["product_id"].nunique()
+    assert anomalies.status_code == 200
+    assert "methodology" in anomalies.json()
+    assert anomalies.json()["isolation_forest"]["supported"] is True
+    assert "fraud" in anomalies.json()["warning"]
+    assert statistics.status_code == 200
+    assert {row["metric"] for row in statistics.json()["descriptive_statistics"]} == {
+        "revenue",
+        "quantity",
+        "average_price",
+    }
+    assert len(statistics.json()["correlation_matrix"]) == 3
 
 
-def test_forecast_suitability_is_explicitly_unsupported():
+def test_forecast_suitability_is_explicitly_unsupported(synthetic_dataset):
     client = TestClient(app)
     response = client.get("/api/forecast/suitability")
     assert response.status_code == 200
     assert response.json()["supported"] is False
     assert "calendar date" in response.json()["reason"].lower()
+    assert response.json()["available_history"]["year_values"] == [2025]
 
 
-def test_menu_and_pricing_endpoints_are_grounded():
+def test_menu_and_pricing_endpoints_are_grounded(synthetic_dataset):
     client = TestClient(app)
     menu = client.get("/api/optimization/menu")
     products = client.get("/api/analytics/products")
     assert menu.status_code == 200
     assert menu.json()["limitation"]
+    assert len(menu.json()["recommendations"]) == synthetic_dataset["product_id"].nunique()
+    expected_products = synthetic_dataset.assign(
+        revenue=synthetic_dataset["transaction_qty"] * synthetic_dataset["unit_price"]
+    ).groupby("product_detail", as_index=False).agg(
+        revenue=("revenue", "sum"),
+        quantity=("transaction_qty", "sum"),
+        average_price=("unit_price", "mean"),
+    )
+    expected_top = expected_products.sort_values("revenue", ascending=False).iloc[0]
     product_name = products.json()["products"][0]["product_detail"]
+    assert product_name == expected_top["product_detail"]
+    assert menu.json()["recommendations"][0]["supporting_metrics"]["revenue"] == expected_top["revenue"]
     scenario = client.get(
         "/api/optimization/pricing",
         params={"product_detail": product_name, "price_change_percent": 10, "quantity_assumption": "baseline"},
     )
     assert scenario.status_code == 200
     assert "hypothetical" in scenario.json()["warning"].lower()
+    assert scenario.json()["product_detail"] == product_name
+    assert scenario.json()["simulated_unit_price"] > scenario.json()["current_unit_price"]
+    assert scenario.json()["current_unit_price"] == expected_top["average_price"]
 
 
-def test_copilot_returns_grounded_response():
+def test_copilot_returns_grounded_response(synthetic_dataset):
     client = TestClient(app)
     response = client.post("/api/copilot", json={"question": "Which product generates the most revenue?"})
     assert response.status_code == 200
-    assert "evidence" in response.json()
+    result = response.json()
+    product_revenue = synthetic_dataset.assign(
+        revenue=synthetic_dataset["transaction_qty"] * synthetic_dataset["unit_price"]
+    ).groupby("product_detail")["revenue"].sum()
+    expected_top = product_revenue.idxmax()
+    assert result["evidence"][0]["metric"] == "product_revenue"
+    assert result["evidence"][0]["product"] == expected_top
+    assert result["evidence"][0]["value"] == product_revenue[expected_top]
