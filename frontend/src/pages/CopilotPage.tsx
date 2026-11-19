@@ -1,5 +1,5 @@
 import { FormEvent, useState } from "react";
-import { getJson } from "../lib/api";
+import { API_BASE_URL } from "../lib/api";
 
 export default function CopilotPage() {
   const [question, setQuestion] = useState("");
@@ -14,7 +14,7 @@ export default function CopilotPage() {
     setLoading(true);
     setResult(null);
     try {
-      const response = await fetch("/api/copilot", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: text }) });
+      const response = await fetch(`${API_BASE_URL}/api/copilot`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: text }) });
       if (!response.ok) throw new Error("Copilot request failed");
       setResult(await response.json());
     } catch {
